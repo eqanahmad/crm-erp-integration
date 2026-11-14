@@ -1,0 +1,12 @@
+.env
+.secrets/
+**/bin/
+**/obj/
+local.settings.json
+__azurite_db*
+__blobstorage__/
+__queuestorage__/
+.vs/
+.DS_Store
+*.user
+TestResults/

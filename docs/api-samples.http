@@ -1,0 +1,32 @@
+# Open in VS Code with the REST Client extension and click "Send Request".
+# Paste values from .secrets/local.env into the variables below (this file is
+# committed, so keep real keys out of it, or copy it to a git-ignored name).
+
+@espo = http://localhost:8081/api/v1
+@espoKey = PASTE_ESPO_API_KEY
+@erp = http://localhost:8082
+@erpToken = token PASTE_ERP_API_KEY:PASTE_ERP_API_SECRET
+
+### EspoCRM: open opportunities
+GET {{espo}}/Opportunity?maxSize=10&select=name,stage,amount,amountCurrency,accountId,accountName
+X-Api-Key: {{espoKey}}
+
+### EspoCRM: one opportunity (replace the id)
+GET {{espo}}/Opportunity/OPPORTUNITY_ID
+X-Api-Key: {{espoKey}}
+
+### EspoCRM: webhooks owned by the API user
+GET {{espo}}/Webhook
+X-Api-Key: {{espoKey}}
+
+### ERPNext: who am I
+GET {{erp}}/api/method/frappe.auth.get_logged_user
+Authorization: {{erpToken}}
+
+### ERPNext: customers
+GET {{erp}}/api/resource/Customer?fields=["name","customer_name","customer_group"]&limit_page_length=20
+Authorization: {{erpToken}}
+
+### ERPNext: sales orders
+GET {{erp}}/api/resource/Sales Order?fields=["name","customer","grand_total","docstatus","status"]&limit_page_length=20
+Authorization: {{erpToken}}

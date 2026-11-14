@@ -1,0 +1,35 @@
+{
+  "name": "crm-erp-integration",
+  "image": "mcr.microsoft.com/devcontainers/dotnet:10.0",
+  "features": {
+    "ghcr.io/devcontainers/features/azure-cli:1": { "installBicep": true },
+    "ghcr.io/devcontainers/features/github-cli:1": {},
+    "ghcr.io/devcontainers/features/node:1": { "version": "lts" },
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {}
+  },
+  // Joins the same Docker network as the local stack, so code in here reaches
+  // espocrm, erpnext, azurite and servicebus-emulator by name, and those
+  // containers reach your Functions at http://crmerp-dev:7071.
+  "initializeCommand": "docker network inspect crmerp >/dev/null 2>&1 || docker network create crmerp",
+  "runArgs": ["--network=crmerp", "--name=crmerp-dev", "--hostname=crmerp-dev"],
+  "forwardPorts": [7071, 5000],
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-dotnettools.csdevkit",
+        "ms-azuretools.vscode-azurefunctions",
+        "ms-azuretools.vscode-bicep",
+        "ms-azuretools.vscode-azureresourcegroups",
+        "ms-azuretools.vscode-containers",
+        "github.vscode-github-actions",
+        "humao.rest-client",
+        "ms-vscode.vscode-node-azure-pack"
+      ]
+    }
+  },
+  "remoteEnv": {
+    "FUNCTIONS_CORE_TOOLS_TELEMETRY_OPTOUT": "1",
+    "DOTNET_CLI_TELEMETRY_OPTOUT": "1"
+  }
+}

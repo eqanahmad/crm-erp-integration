@@ -1,0 +1,288 @@
+# Local stack for the CRM to ERP integration project.
+# Start everything with ./scripts/up.sh (it creates the shared network and picks
+# the right CPU platform for each image on Apple Silicon).
+#
+# Profiles:
+#   crm    EspoCRM and its database
+#   erp    ERPNext (frappe_docker layout, v16)
+#   azure  Azurite and the Service Bus emulator (with SQL Server)
+#   tools  webhook inspector
+#   seed   one-shot seeding job (run by up.sh)
+
+name: crmerp
+
+x-erpnext: &erpnext
+  image: frappe/erpnext:${ERPNEXT_VERSION:-v16.55.0}
+  platform: ${ERPNEXT_PLATFORM:-linux/arm64}
+  profiles: ["erp"]
+  restart: on-failure
+  volumes:
+    - erp-sites:/home/frappe/frappe-bench/sites
+    - erp-logs:/home/frappe/frappe-bench/logs
+
+services:
+  # ---------------------------------------------------------------- EspoCRM
+  espocrm-db:
+    image: mariadb:11.8
+    profiles: ["crm"]
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: ${ESPO_DB_ROOT_PASSWORD}
+      MARIADB_DATABASE: espocrm
+      MARIADB_USER: espocrm
+      MARIADB_PASSWORD: ${ESPO_DB_PASSWORD}
+    volumes:
+      - espo-db:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  espocrm:
+    image: espocrm:${ESPOCRM_VERSION:-10}
+    profiles: ["crm"]
+    restart: unless-stopped
+    depends_on:
+      espocrm-db:
+        condition: service_healthy
+    environment:
+      ESPOCRM_DATABASE_PLATFORM: Mysql
+      ESPOCRM_DATABASE_HOST: espocrm-db
+      ESPOCRM_DATABASE_NAME: espocrm
+      ESPOCRM_DATABASE_USER: espocrm
+      ESPOCRM_DATABASE_PASSWORD: ${ESPO_DB_PASSWORD}
+      ESPOCRM_ADMIN_USERNAME: admin
+      ESPOCRM_ADMIN_PASSWORD: ${ESPO_ADMIN_PASSWORD}
+      ESPOCRM_SITE_URL: http://localhost:${ESPO_PORT:-8081}
+    volumes:
+      - espo-data:/var/www/html/data
+      - espo-custom:/var/www/html/custom
+      - espo-custom-client:/var/www/html/client/custom
+    ports:
+      - "${ESPO_PORT:-8081}:80"
+
+  # Runs EspoCRM's scheduled jobs every minute. Webhooks are sent by a scheduled
+  # job, so without this container no webhook ever fires.
+  espocrm-daemon:
+    image: espocrm:${ESPOCRM_VERSION:-10}
+    profiles: ["crm"]
+    restart: unless-stopped
+    entrypoint: docker-daemon.sh
+    depends_on:
+      - espocrm
+    volumes_from:
+      - espocrm
+
+  # ---------------------------------------------------------------- ERPNext
+  erp-db:
+    image: mariadb:11.8
+    profiles: ["erp"]
+    restart: unless-stopped
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --skip-character-set-client-handshake
+      - --innodb-snapshot-isolation=OFF
+    environment:
+      MARIADB_ROOT_PASSWORD: ${ERP_DB_ROOT_PASSWORD}
+    volumes:
+      - erp-db:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  erp-redis-cache:
+    image: redis:7-alpine
+    profiles: ["erp"]
+    restart: unless-stopped
+
+  erp-redis-queue:
+    image: redis:7-alpine
+    profiles: ["erp"]
+    restart: unless-stopped
+    volumes:
+      - erp-redis-queue:/data
+
+  erp-configurator:
+    <<: *erpnext
+    restart: "no"
+    entrypoint: ["bash", "-c"]
+    command:
+      - >
+        ls -1 apps > sites/apps.txt;
+        bench set-config -g db_host erp-db;
+        bench set-config -gp db_port 3306;
+        bench set-config -g redis_cache "redis://erp-redis-cache:6379";
+        bench set-config -g redis_queue "redis://erp-redis-queue:6379";
+        bench set-config -g redis_socketio "redis://erp-redis-queue:6379";
+        bench set-config -gp socketio_port 9000;
+    depends_on:
+      erp-db:
+        condition: service_healthy
+
+  erp-create-site:
+    <<: *erpnext
+    restart: "no"
+    entrypoint: ["bash", "-c"]
+    environment:
+      ERP_ADMIN_PASSWORD: ${ERP_ADMIN_PASSWORD}
+      ERP_DB_ROOT_PASSWORD: ${ERP_DB_ROOT_PASSWORD}
+    command:
+      - |
+        set -e
+        wait-for-it -t 120 erp-db:3306
+        wait-for-it -t 120 erp-redis-cache:6379
+        wait-for-it -t 120 erp-redis-queue:6379
+        if [ -d sites/frontend ]; then
+          echo "Site frontend already exists, skipping creation"
+        else
+          bench new-site frontend --mariadb-user-host-login-scope='%' --admin-password="$$ERP_ADMIN_PASSWORD" --db-root-username=root --db-root-password="$$ERP_DB_ROOT_PASSWORD" --install-app erpnext --set-default
+        fi
+        bench --site frontend set-config host_name "http://localhost:${ERP_PORT:-8082}"
+        echo "ERPNext site ready"
+    depends_on:
+      erp-configurator:
+        condition: service_completed_successfully
+
+  erp-backend:
+    <<: *erpnext
+    depends_on:
+      erp-create-site:
+        condition: service_completed_successfully
+
+  erp-websocket:
+    <<: *erpnext
+    command: ["node", "/home/frappe/frappe-bench/apps/frappe/socketio.js"]
+    environment:
+      FRAPPE_REDIS_CACHE: redis://erp-redis-cache:6379
+      FRAPPE_REDIS_QUEUE: redis://erp-redis-queue:6379
+    depends_on:
+      erp-create-site:
+        condition: service_completed_successfully
+
+  erp-queue:
+    <<: *erpnext
+    command: ["bench", "worker", "--queue", "long,default,short"]
+    environment:
+      FRAPPE_REDIS_CACHE: redis://erp-redis-cache:6379
+      FRAPPE_REDIS_QUEUE: redis://erp-redis-queue:6379
+    depends_on:
+      erp-create-site:
+        condition: service_completed_successfully
+
+  erp-scheduler:
+    <<: *erpnext
+    command: ["bench", "schedule"]
+    depends_on:
+      erp-create-site:
+        condition: service_completed_successfully
+
+  erpnext:
+    <<: *erpnext
+    command: ["nginx-entrypoint.sh"]
+    environment:
+      BACKEND: erp-backend:8000
+      SOCKETIO: erp-websocket:9000
+      FRAPPE_SITE_NAME_HEADER: frontend
+      UPSTREAM_REAL_IP_ADDRESS: 127.0.0.1
+      UPSTREAM_REAL_IP_HEADER: X-Forwarded-For
+      UPSTREAM_REAL_IP_RECURSIVE: "off"
+      PROXY_READ_TIMEOUT: 120
+      CLIENT_MAX_BODY_SIZE: 50m
+    depends_on:
+      - erp-backend
+      - erp-websocket
+    ports:
+      - "${ERP_PORT:-8082}:8080"
+
+  # ---------------------------------------------------------------- Azure emulators
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:latest
+    profiles: ["azure"]
+    restart: unless-stopped
+    command: >
+      azurite --blobHost 0.0.0.0 --queueHost 0.0.0.0 --tableHost 0.0.0.0
+      --location /data --skipApiVersionCheck --loose
+    volumes:
+      - azurite-data:/data
+    ports:
+      - "10000:10000"
+      - "10001:10001"
+      - "10002:10002"
+
+  # SQL Server is the emulator's backing store. It has no ARM64 build, so on
+  # Apple Silicon it runs under Rosetta (Docker Desktop setting, on by default).
+  servicebus-sql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    platform: linux/amd64
+    profiles: ["azure"]
+    restart: unless-stopped
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: ${SB_SQL_PASSWORD}
+
+  servicebus-emulator:
+    image: mcr.microsoft.com/azure-messaging/servicebus-emulator:latest
+    platform: ${SB_PLATFORM:-linux/amd64}
+    container_name: servicebus-emulator
+    profiles: ["azure"]
+    restart: unless-stopped
+    depends_on:
+      - servicebus-sql
+    environment:
+      SQL_SERVER: servicebus-sql
+      MSSQL_SA_PASSWORD: ${SB_SQL_PASSWORD}
+      ACCEPT_EULA: "Y"
+      SQL_WAIT_INTERVAL: "20"
+      EMULATOR_HTTP_PORT: "5300"
+    volumes:
+      - ./local/servicebus/Config.json:/ServiceBus_Emulator/ConfigFiles/Config.json:ro
+    ports:
+      - "5672:5672"
+      - "5300:5300"
+
+  # ---------------------------------------------------------------- Tools
+  # Echoes and logs every request it receives. Point a webhook here to see the
+  # exact payload and headers before you write the Function that handles it.
+  webhook-inspector:
+    image: mendhak/http-https-echo:37
+    profiles: ["tools"]
+    restart: unless-stopped
+    environment:
+      HTTP_PORT: 8080
+      LOG_IGNORE_PATH: /healthz
+    ports:
+      - "${INSPECTOR_PORT:-8083}:8080"
+
+  seed:
+    image: python:3.13-slim
+    profiles: ["seed"]
+    working_dir: /work
+    env_file: .env
+    environment:
+      ESPO_URL: http://espocrm
+      ERP_URL: http://erpnext:8080
+      INSPECTOR_URL: http://webhook-inspector:8080
+    volumes:
+      - ./local/seed:/work:ro
+      - ./.secrets:/secrets
+    command: ["python", "-u", "seed.py"]
+
+volumes:
+  espo-db:
+  espo-data:
+  espo-custom:
+  espo-custom-client:
+  erp-db:
+  erp-redis-queue:
+  erp-sites:
+  erp-logs:
+  azurite-data:
+
+networks:
+  default:
+    name: crmerp
+    external: true
